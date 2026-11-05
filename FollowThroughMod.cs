@@ -270,8 +270,7 @@ public static partial class FollowThroughMod
         h.Patch(_mOnCombatWon, prefix: M(nameof(OnCombatWonPrefix)));
         if (_mRoomExitTree != null) h.Patch(_mRoomExitTree, prefix: M(nameof(RoomExitTreePrefix)));
         if (_mAddResults != null) h.Patch(_mAddResults, postfix: M(nameof(AddResultsPostfix)));
-        int inputs = PatchInputHandlers(h);
-        GD.Print($"{Tag} patches applied: RemoveCreatureNode, ModifyAttackHitCount, AfterAttack, OnCombatWon{(_mRoomExitTree != null ? ", NCombatRoom._ExitTree" : "")}{(_mAddResults != null ? ", AddResultsInternal" : "")}, {inputs} input handlers");
+        GD.Print($"{Tag} patches applied: RemoveCreatureNode, ModifyAttackHitCount, AfterAttack, OnCombatWon{(_mRoomExitTree != null ? ", NCombatRoom._ExitTree" : "")}{(_mAddResults != null ? ", AddResultsInternal" : "")}");
     }
 
     // Kill switch: log once, stop doing anything. Patches stay but every one of them is a pass-through.

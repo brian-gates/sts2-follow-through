@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 GAME_DIR="${STS2GameDir:-$HOME/Library/Application Support/Steam/steamapps/common/Slay the Spire 2}"
 MODS_DIR="${MODS_DIR:-$GAME_DIR/SlayTheSpire2.app/Contents/MacOS/mods}"
 
-if pgrep -f SlayTheSpire2 >/dev/null; then
+if pgrep -x "Slay the Spire 2" >/dev/null || pgrep -f "SlayTheSpire2.app/Contents/MacOS" >/dev/null; then
   echo "Slay the Spire 2 is running; quit it first (mods load at startup)." >&2
   exit 1
 fi

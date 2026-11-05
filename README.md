@@ -21,9 +21,10 @@ co-op. Each player sees the replay on their own screen.
   timeout scales with the replay: remaining x gap + 3 s, never under 6 s.
 - Skip: once a replay has run `skip_after_seconds` with more than 0.75 s left, a "Click to skip" hint
   fades in. The first click, key or controller button then ends the replay and releases the rewards.
-  That input is consumed: a prefix on every `_Input`/`_GuiInput`/`_Unhandled*Input` in sts2.dll marks it
-  handled before any game node or GUI control acts on it. Short replays never arm the skip and input passes
-  through untouched.
+  While armed, one node of the mod's own sits on top (a CanvasLayer added as the root's last child, so its
+  `_Input` runs before any game node's, plus a full-rect `MouseFilter=Stop` Control). It marks button,
+  key and controller events handled, so nothing underneath reacts. Motion and the mouse wheel pass
+  through. The node is removed when the replay ends, or 0.35 s after a skip. Short replays never add it.
 - `NCombatRoom._ExitTree` prefix: cancels any replay.
 
 Game members are resolved by name at startup. If any lookup fails, the mod logs once and disables
