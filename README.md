@@ -21,10 +21,13 @@ co-op. Each player sees the replay on their own screen.
   timeout scales with the replay: remaining x gap + 3 s, never under 6 s.
 - Skip: once a replay has run `skip_after_seconds` with more than 0.75 s left, a "Click to skip" hint
   fades in. The first click, key or controller button then ends the replay and releases the rewards.
-  While armed, one node of the mod's own sits on top (a CanvasLayer added as the root's last child, so its
-  `_Input` runs before any game node's, plus a full-rect `MouseFilter=Stop` Control). It marks button,
-  key and controller events handled, so nothing underneath reacts. Motion and the mouse wheel pass
-  through. The node is removed when the replay ends, or 0.35 s after a skip. Short replays never add it.
+  While armed, one temporary catcher sits on top: a CanvasLayer (Layer 1024) holding a full-rect Control
+  with `MouseFilter=Stop` and `FocusMode=All` that grabs focus. Clicks, keys and controller buttons reach it
+  through the Control's `GuiInput` signal, and `AcceptEvent()` stops them there, so nothing underneath
+  reacts. Signals are used because mod-defined Node subclasses are not registered Godot scripts, so `_Input`
+  overrides never run. A fallback polls `Input.IsAnythingPressed()` for a press that never reaches the
+  signal; it skips but cannot consume. Motion and the mouse wheel pass through. The catcher is removed when
+  the replay ends, or 0.35 s after a skip. Short replays never add it.
 - `NCombatRoom._ExitTree` prefix: cancels any replay.
 
 Game members are resolved by name at startup. If any lookup fails, the mod logs once and disables
@@ -44,6 +47,11 @@ added on each launch:
 | `skip_after_seconds` | 2.0 | the skip (hint and input) arms only after this long |
 | `fallback_hit_sfx` | true | play the corpse's impact sound when the attack has no hit sound |
 | `default_hit_gap_sec` | 0.3 | per-hit spacing when the real rhythm is unknown |
+
+Debug-only keys (never written by the mod; add them by hand to test the skip in-game):
+`debug_inject_skip_after_seconds` (>0 injects a click via `Input.ParseInputEvent` that long after the skip
+arms), `debug_inject_key` (inject Enter instead), and `debug_inject_prearm_seconds` (>0 injects a click at that
+replay time before arming, to check pass-through).
 
 ## Build & install (macOS)
 

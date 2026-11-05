@@ -4,16 +4,22 @@ using Godot;
 namespace STS2_FollowThrough;
 
 // Skipping a long replay. The skip arms only once the replay has run for skip_after_seconds AND more than
-// SkipMinRemainingSec is still left; short replays never add anything and never touch input.
+// SkipMinRemainingSec is still left; short replays add nothing and never touch input.
 //
-// While armed (and for a short grace after a skip) ONE node of ours sits on top: SkipCatcher, a CanvasLayer
-// added as the root's last child. Godot sends each event to _Input in reverse tree order, so the root's last
-// child sees it before every game node (the game's NButtons act in _Input). On a mouse button / key /
-// joypad button event it marks the event handled (Viewport.SetInputAsHandled), so no game node, GUI control
-// or hotkey handler sees it, and a press triggers the skip. A full-rect Control with MouseFilter=Stop inside
-// it also accepts any GUI-stage click (AcceptEvent), as a second line. Motion and wheel pass through.
-// The node is removed when the replay ends, or 0.35 s after a skip (so the release half of the click and a
-// double-click are swallowed too).
+// While armed (and for a 0.35 s grace after a skip) one temporary catcher sits on top: a CanvasLayer with a
+// very high Layer holding a full-rect Control (MouseFilter=Stop, FocusMode=All) that has keyboard focus.
+// Input reaches it through the Control's GuiInput SIGNAL (a plain C# event subscription). Mod-defined
+// Node subclasses are not registered as Godot scripts, so virtual overrides such as _Input are never called;
+// signals work on plain engine nodes.
+//   - Mouse: the Stop control is the topmost GUI control everywhere, so every click's GUI stage lands on it;
+//     AcceptEvent() marks it handled and nothing under it (and no _UnhandledInput hotkey) sees it. While it
+//     covers the screen nothing below is hovered, so buttons that act on hover+release cannot fire either.
+//   - Keys / controller buttons: GUI key and joypad events go to the focused control; the catcher grabs focus,
+//     so they arrive on the same GuiInput signal and are accepted there.
+//   - Fallback (documented, not consuming): if a key/button press never reaches the signal (e.g. a game node
+//     handles it in _Input first), the replay loop also polls Input.IsAnythingPressed() on a rising edge while
+//     armed and skips; that path cannot consume the event.
+// Motion and the mouse wheel pass through untouched.
 public static partial class FollowThroughMod
 {
     private static bool IsButtonLike(InputEvent? ev, out bool pressed)
@@ -30,35 +36,20 @@ public static partial class FollowThroughMod
                 pressed = jb.Pressed; return true;
             case InputEventScreenTouch st:
                 pressed = st.Pressed; return true;
+            case InputEventAction a:
+                pressed = a.Pressed; return true;
             default:
                 return false;
         }
     }
 
-    // Our single input-eating node. Only exists while the skip is armed (plus the post-skip grace).
-    private sealed class SkipCatcher : CanvasLayer
-    {
-        private bool _logged;
-
-        public override void _Input(InputEvent @event)
-        {
-            try
-            {
-                if (!IsButtonLike(@event, out bool pressed)) return;
-                if (!_logged) { _logged = true; Dbg($"skip catcher: _Input received {@event.GetType().Name} (consumed)"); }
-                GetViewport()?.SetInputAsHandled();
-                if (pressed) Skip.Request(@event);
-            }
-            catch { }
-        }
-    }
-
     private static class Skip
     {
-        private static bool _running, _armed, _requested;
-        private static ulong _t0;
+        private static bool _running, _armed, _requested, _anyPressedAtArm, _injected, _prearmInjected;
+        private static ulong _t0, _armedAt;
         private static float _total;
-        private static SkipCatcher? _catcher;
+        private static CanvasLayer? _catcher;
+        private static Control? _blocker;
         private static Label? _hint;
 
         public static bool Requested => _requested;
@@ -66,27 +57,56 @@ public static partial class FollowThroughMod
         public static void Begin(ulong t0, float totalSec)
         {
             End();
-            _running = true; _armed = false; _requested = false;
+            _running = true; _armed = false; _requested = false; _injected = false; _prearmInjected = false;
             _t0 = t0; _total = totalSec;
         }
 
         // Called every frame by the replay's wait loop.
         public static void Tick()
         {
-            if (!_running || _armed || _requested) return;
+            if (!_running || _requested) return;
             float elapsed = (Time.GetTicksMsec() - _t0) / 1000f;
-            float left = _total - elapsed;
-            if (elapsed < _skipAfterSec || left <= SkipMinRemainingSec) return;
-            _armed = true;
-            Dbg($"skip ARMED after {elapsed:0.00}s ({left:0.00}s left); hint={_showSkipHint}");
-            AddCatcher();
+            if (!_armed)
+            {
+                if (_dbgInjectPrearmSec > 0f && !_prearmInjected && elapsed >= _dbgInjectPrearmSec)
+                {
+                    _prearmInjected = true;
+                    Dbg($"DEBUG inject (pre-arm) click at {elapsed:0.00}s; catcher present={_catcher != null}");
+                    InjectClick();
+                }
+                float left = _total - elapsed;
+                if (elapsed < _skipAfterSec || left <= SkipMinRemainingSec) return;
+                _armed = true;
+                _armedAt = Time.GetTicksMsec();
+                _anyPressedAtArm = SafeAnyPressed();
+                Dbg($"skip ARMED after {elapsed:0.00}s ({left:0.00}s left); hint={_showSkipHint}");
+                AddCatcher();
+                return;
+            }
+            // Debug-only injection, shortly after arming.
+            if (_dbgInjectAfterArmSec > 0f && !_injected && (Time.GetTicksMsec() - _armedAt) / 1000f >= _dbgInjectAfterArmSec)
+            {
+                _injected = true;
+                if (_dbgInjectKey) { Dbg("DEBUG inject key Enter (armed)"); InjectKey(); }
+                else { Dbg("DEBUG inject click at the rewards area (armed)"); InjectClick(); }
+                return;
+            }
+            // Polling fallback: a fresh press that never reached the signal still skips (not consumed).
+            bool any = SafeAnyPressed();
+            if (any && !_anyPressedAtArm) Request("poll:Input.IsAnythingPressed");
+            _anyPressedAtArm = any && _anyPressedAtArm;
         }
 
-        public static void Request(InputEvent ev)
+        private static bool SafeAnyPressed()
+        {
+            try { return Input.IsAnythingPressed(); } catch { return false; }
+        }
+
+        public static void Request(string via)
         {
             if (!_running || !_armed || _requested) return;
             _requested = true;
-            Dbg($"skip requested by {ev.GetType().Name} at {(Time.GetTicksMsec() - _t0) / 1000f:0.00}s; input consumed");
+            Dbg($"skip requested via {via} at {(Time.GetTicksMsec() - _t0) / 1000f:0.00}s");
             HideHint();
             RemoveCatcherAfter(0.35f);
         }
@@ -96,7 +116,19 @@ public static partial class FollowThroughMod
             bool wasSkipped = _requested;
             _running = false; _armed = false;
             HideHint();
-            if (!wasSkipped) RemoveCatcherNow();   // a skip removes it itself after the grace
+            if (!wasSkipped) RemoveCatcherNow("replay ended");   // a skip removes it itself after the grace
+        }
+
+        private static void OnGuiInput(InputEvent ev)
+        {
+            try
+            {
+                if (!IsButtonLike(ev, out bool pressed)) return;
+                _blocker?.AcceptEvent();
+                Dbg($"skip catcher got {ev.GetType().Name} pressed={pressed} (accepted)");
+                if (pressed) Request($"signal:{ev.GetType().Name}");
+            }
+            catch { }
         }
 
         private static void AddCatcher()
@@ -104,43 +136,53 @@ public static partial class FollowThroughMod
             try
             {
                 if (Engine.GetMainLoop() is not SceneTree tree || tree.Root == null) return;
-                RemoveCatcherNow();
-                var catcher = new SkipCatcher { Layer = 1024, Name = "FollowThroughSkipCatcher" };
-                var blocker = new Control { MouseFilter = Control.MouseFilterEnum.Stop, Name = "Blocker" };
-                blocker.SetAnchorsPreset(Control.LayoutPreset.FullRect);
-                blocker.GuiInput += ev =>
+                RemoveCatcherNow("re-arm");
+                var layer = new CanvasLayer { Layer = 1024, Name = "FollowThroughSkipCatcher" };
+                var blocker = new Control
                 {
-                    try
-                    {
-                        if (!IsButtonLike(ev, out bool pressed)) return;
-                        blocker.AcceptEvent();
-                        Dbg($"skip catcher: GUI-stage {ev.GetType().Name} accepted");
-                        if (pressed) Request(ev);
-                    }
-                    catch { }
+                    Name = "Blocker",
+                    MouseFilter = Control.MouseFilterEnum.Stop,
+                    FocusMode = Control.FocusModeEnum.All,
                 };
-                catcher.AddChild(blocker);
-                if (_showSkipHint) { _hint = MakeHint(tree.Root); if (_hint != null) catcher.AddChild(_hint); }
-                tree.Root.AddChild(catcher);   // last child of the root: first to receive _Input
-                catcher.SetProcessInput(true);
-                _catcher = catcher;
+                blocker.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+                blocker.GuiInput += OnGuiInput;
+                layer.AddChild(blocker);
+                if (_showSkipHint) { _hint = MakeHint(tree.Root); if (_hint != null) layer.AddChild(_hint); }
+                tree.Root.AddChild(layer);
+                blocker.GrabFocus();
+                _catcher = layer; _blocker = blocker;
                 if (_hint != null) _hint.CreateTween().TweenProperty(_hint, "modulate:a", 0.85f, 0.3f);
+                Dbg($"skip catcher ADDED (layer {layer.Layer}, rect {blocker.GetGlobalRect()}, focus={blocker.HasFocus()})");
             }
-            catch (Exception ex) { Dbg($"skip catcher failed (skip unavailable): {ex.Message}"); RemoveCatcherNow(); }
+            catch (Exception ex) { Dbg($"skip catcher failed (skip unavailable): {ex.Message}"); RemoveCatcherNow("error"); }
         }
 
         private static void RemoveCatcherAfter(float sec)
         {
             var c = _catcher;
             if (c == null || !GodotObject.IsInstanceValid(c)) return;
-            try { c.GetTree().CreateTimer(sec).Timeout += () => { try { if (GodotObject.IsInstanceValid(c)) c.QueueFree(); } catch { } if (ReferenceEquals(_catcher, c)) _catcher = null; }; }
-            catch { RemoveCatcherNow(); }
+            try
+            {
+                c.GetTree().CreateTimer(sec).Timeout += () =>
+                {
+                    if (ReferenceEquals(_catcher, c)) RemoveCatcherNow($"{sec:0.00}s after skip");
+                    else try { if (GodotObject.IsInstanceValid(c)) c.QueueFree(); } catch { }
+                };
+            }
+            catch { RemoveCatcherNow("timer error"); }
         }
 
-        private static void RemoveCatcherNow()
+        private static void RemoveCatcherNow(string why)
         {
-            try { if (_catcher != null && GodotObject.IsInstanceValid(_catcher)) _catcher.QueueFree(); } catch { }
-            _catcher = null; _hint = null;
+            if (_catcher == null) return;
+            try
+            {
+                if (_blocker != null && GodotObject.IsInstanceValid(_blocker)) _blocker.GuiInput -= OnGuiInput;
+                if (GodotObject.IsInstanceValid(_catcher)) _catcher.QueueFree();
+            }
+            catch { }
+            _catcher = null; _blocker = null; _hint = null;
+            Dbg($"skip catcher REMOVED ({why})");
         }
 
         private static void HideHint()
@@ -149,7 +191,30 @@ public static partial class FollowThroughMod
             _hint = null;
         }
 
-        // Small "Click to skip" at bottom-centre: game font, cream text, dark outline; fades in over 0.3 s.
+        // ===== Debug-only injection (Input.ParseInputEvent: goes through the game's normal input path) =====
+
+        private static Vector2 RewardsAreaPoint()
+        {
+            // Where the first reward row (gold) appears on the rewards screen.
+            var size = (Engine.GetMainLoop() as SceneTree)?.Root?.GetVisibleRect().Size ?? new Vector2(1920, 1080);
+            return new Vector2(size.X * 0.5f, size.Y * 0.43f);
+        }
+
+        private static void InjectClick()
+        {
+            var p = RewardsAreaPoint();
+            foreach (bool down in new[] { true, false })
+                Input.ParseInputEvent(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = down, Position = p, GlobalPosition = p, ButtonMask = down ? MouseButtonMask.Left : 0 });
+        }
+
+        private static void InjectKey()
+        {
+            foreach (bool down in new[] { true, false })
+                Input.ParseInputEvent(new InputEventKey { Keycode = Key.Enter, PhysicalKeycode = Key.Enter, Pressed = down });
+        }
+
+        // ===== Hint: small "Click to skip" at bottom-centre, game font, cream text, dark outline =====
+
         private static Label? MakeHint(Window root)
         {
             try
@@ -177,7 +242,6 @@ public static partial class FollowThroughMod
             catch (Exception ex) { Dbg($"hint failed (ignored): {ex.Message}"); return null; }
         }
 
-        // Borrow the font of a visible game Label so the hint matches the game's typography.
         private static Font? GameFont(Node root)
         {
             try

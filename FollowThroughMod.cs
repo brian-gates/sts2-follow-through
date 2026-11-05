@@ -50,6 +50,10 @@ public static partial class FollowThroughMod
     private const float SkipMinRemainingSec = 0.75f; // ...and only if at least this much is still left
     private static bool _fallbackHitSfx = true;    // no HitSfx on the attack => the corpse's own TakeDamageSfx
     private static float _defaultHitGapSec = 0.3f; // per-hit spacing when the real attack's cadence is unknown
+    // Debug-only in-game input injection for testing the skip (never written to the conf; off unless set):
+    private static float _dbgInjectAfterArmSec;     // >0: inject a click (or key) this long after the skip arms
+    private static bool _dbgInjectKey;              // inject a key press (ui_accept's Enter) instead of a click
+    private static float _dbgInjectPrearmSec;       // >0: inject a click at this replay time if not armed yet
     private const float MinGapSec = 0.05f;
 
     private static bool _disabled;
@@ -125,6 +129,9 @@ public static partial class FollowThroughMod
                 if (root.TryGetProperty("show_skip_hint", out var sh)) _showSkipHint = sh.ValueKind != JsonValueKind.False;
                 if (root.TryGetProperty("skip_after_seconds", out var sa) && sa.TryGetSingle(out var sav)) _skipAfterSec = Math.Clamp(sav, 0f, 60f);
                 if (root.TryGetProperty("fallback_hit_sfx", out var fb)) _fallbackHitSfx = fb.ValueKind != JsonValueKind.False;
+                if (root.TryGetProperty("debug_inject_skip_after_seconds", out var di) && di.TryGetSingle(out var div)) _dbgInjectAfterArmSec = Math.Max(0f, div);
+                if (root.TryGetProperty("debug_inject_key", out var dk)) _dbgInjectKey = dk.ValueKind == JsonValueKind.True;
+                if (root.TryGetProperty("debug_inject_prearm_seconds", out var dp) && dp.TryGetSingle(out var dpv)) _dbgInjectPrearmSec = Math.Max(0f, dpv);
                 if (root.TryGetProperty("default_hit_gap_sec", out var dg) && dg.TryGetSingle(out var dgv)) _defaultHitGapSec = Math.Clamp(dgv, MinGapSec, 2f);
                 foreach (var prop in root.EnumerateObject()) known[prop.Name] = prop.Value.Clone();
             }
