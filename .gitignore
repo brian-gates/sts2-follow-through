@@ -1,0 +1,10 @@
+bin/
+obj/
+out/
+*.dll
+*.pdb
+*.user
+.vs/
+.idea/
+.mcp.json
+dist/
