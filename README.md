@@ -10,13 +10,20 @@ co-op. Each player sees the replay on their own screen.
 ## How it works
 
 - `NCombatRoom.RemoveCreatureNode` prefix: saves each dying creature's `NCreature.VfxSpawnPosition`.
-- `Hook.ModifyAttackHitCount` postfix: records the real hit count for each `AttackCommand`.
+- `Hook.ModifyAttackHitCount` postfix: records the real hit count of each `AttackCommand`;
+  `AttackCommand.AddResultsInternal` postfix: timestamps each real hit (the attack's natural rhythm).
 - `Hook.AfterAttack` prefix: if hits remain (`attackCount - _results.Count`), the attacker is alive and
-  `CombatManager.IsEnding`, it starts a Godot-only replay. The replay uses `NCreature.SetAnimationTrigger`,
-  `SfxCmd.Play`, `VfxCmd.PlayVfx(Vector2, string, Control)` and `NDamageNumVfx.Create(Vector2, int)`.
-  Long chains are sped up to fit within `max_total_sec`.
-- `NCombatUi.OnCombatWon` prefix: while a replay is running, holds the call and runs the original
-  handler once the replay ends (`hold_timeout_sec` cap).
+  `CombatManager.IsEnding`, starts a Godot-only replay at the attack's own per-hit spacing (measured, else
+  the last measured for that attack style, else `default_hit_gap_sec`). It uses `NCreature.SetAnimationTrigger`,
+  `SfxCmd.Play`, `VfxCmd.PlayVfx(Vector2, string, Control)` and `NDamageNumVfx.Create(Vector2, int)`. When the
+  attack has no hit sound, the corpse's own `MonsterModel.TakeDamageSfx` impact is used.
+- `NCombatUi.OnCombatWon` prefix: holds the local rewards screen until the replay ends. The safety
+  timeout scales with the replay: remaining x gap + 3 s, never under 6 s.
+- Skip: once a replay has run `skip_after_seconds` with more than 0.75 s left, a "Click to skip" hint
+  fades in. The first click, key or controller button then ends the replay and releases the rewards.
+  That input is consumed: a prefix on every `_Input`/`_GuiInput`/`_Unhandled*Input` in sts2.dll marks it
+  handled before any game node or GUI control acts on it. Short replays never arm the skip and input passes
+  through untouched.
 - `NCombatRoom._ExitTree` prefix: cancels any replay.
 
 Game members are resolved by name at startup. If any lookup fails, the mod logs once and disables
@@ -24,9 +31,18 @@ itself. If a patch throws at runtime, the mod logs once and unpatches.
 
 ## Config
 
-`STS2_FollowThrough.conf` sits next to the DLL in `mods/` and is created on first run:
-`enabled`, `debug` (logs each replay decision as `[FollowThrough] ...` in godot.log), `max_total_sec`,
-`hit_interval_sec`, `hold_timeout_sec`.
+`STS2_FollowThrough.conf` sits next to the DLL in `mods/`. It is created on first run, and missing keys are
+added on each launch:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `enabled` | true | |
+| `debug` | true | log each replay decision as `[FollowThrough] ...` in godot.log |
+| `max_replay_seconds` | 0 | 0 = no cap; >0 compresses the spacing so the replay fits |
+| `show_skip_hint` | true | show the "Click to skip" hint when the skip arms |
+| `skip_after_seconds` | 2.0 | the skip (hint and input) arms only after this long |
+| `fallback_hit_sfx` | true | play the corpse's impact sound when the attack has no hit sound |
+| `default_hit_gap_sec` | 0.3 | per-hit spacing when the real rhythm is unknown |
 
 ## Build & install (macOS)
 

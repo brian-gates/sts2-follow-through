@@ -35,19 +35,22 @@ namespace STS2_FollowThrough;
 // Every game member is resolved by name at startup. Any lookup failure logs once and disables the mod
 // (no patches applied). Any runtime exception in our code logs once and disables it (pass-through).
 [ModInitializer("Initialize")]
-public static class FollowThroughMod
+public static partial class FollowThroughMod
 {
     private const string Tag = "[FollowThrough]";
-    private const string BuildTag = "2026-11-04-spike";
+    private const string BuildTag = "2026-11-05-skip";
     private const string ConfigFileName = "STS2_FollowThrough.conf";
     private const string HarmonyId = "com.sts2followthrough";
 
     // Config
-    private static bool _debug = true;          // log each replay decision (spike default: on)
-    private static float _maxTotalSec = 3.0f;    // cap on the whole replay; long chains are sped up
-    private static float _hitIntervalSec = 0.16f;
-    private static float _minIntervalSec = 0.05f;
-    private static float _holdTimeoutSec = 6.0f; // never hold rewards longer than this
+    private static bool _debug = true;            // log each replay decision (spike default: on)
+    private static float _maxReplaySec = 0f;       // 0 = no cap (natural rhythm); >0 compresses spacing to fit
+    private static bool _showSkipHint = true;
+    private static float _skipAfterSec = 2.0f;     // skip (hint + input) only arms after this much replay...
+    private const float SkipMinRemainingSec = 0.75f; // ...and only if at least this much is still left
+    private static bool _fallbackHitSfx = true;    // no HitSfx on the attack => the corpse's own TakeDamageSfx
+    private static float _defaultHitGapSec = 0.3f; // per-hit spacing when the real attack's cadence is unknown
+    private const float MinGapSec = 0.05f;
 
     private static bool _disabled;
 
@@ -56,6 +59,10 @@ public static class FollowThroughMod
     private static readonly ConditionalWeakTable<Creature, StrongBox<Vector2>> _deathPos = new();
     // AttackCommand -> the real hit count the game computed (after ModifyAttackHitCount).
     private static readonly ConditionalWeakTable<object, StrongBox<int>> _hitCounts = new();
+    // AttackCommand -> time (ms) each real hit's results were recorded: the attack's natural rhythm.
+    private static readonly ConditionalWeakTable<object, List<ulong>> _hitTimes = new();
+    // Last measured per-hit gap by attack style (anim|vfx), for attacks that died on hit 1.
+    private static readonly Dictionary<string, float> _gapByStyle = new();
     // Pending replay (completed by the main-thread replay); null when nothing is playing.
     private static TaskCompletionSource<bool>? _replay;
     private static int _generation;              // bumped on room exit: cancels a running replay
@@ -73,7 +80,8 @@ public static class FollowThroughMod
     private static MethodInfo? _mSetAnimTrigger;
     private static PropertyInfo? _pCreaturePlayer, _pPlayerCharacter, _pCharAttackSfx;
     private static MethodInfo? _mGetCreatureNode, _mPlayVfx, _mSfxPlay, _mDebugAudioPlay, _mDamageNumCreate;
-    private static MethodInfo? _mRemoveCreatureNode, _mModifyHitCount, _mAfterAttack, _mOnCombatWon, _mRoomExitTree;
+    private static MethodInfo? _mRemoveCreatureNode, _mModifyHitCount, _mAfterAttack, _mOnCombatWon, _mRoomExitTree, _mAddResults;
+    private static PropertyInfo? _pCreatureMonster, _pTakeDamageSfx;
     private static PropertyInfo? _pResReceiver, _pResBlocked, _pResUnblocked, _pResOverkill;
 
     public static void Initialize()
@@ -88,7 +96,7 @@ public static class FollowThroughMod
                 return;
             }
             ApplyPatches();
-            GD.Print($"{Tag} initialized (build {BuildTag}, debug={_debug}, max_total={_maxTotalSec}s, hold_timeout={_holdTimeoutSec}s)");
+            GD.Print($"{Tag} initialized (build {BuildTag}, debug={_debug}, max_replay_seconds={_maxReplaySec}, show_skip_hint={_showSkipHint}, skip_after_seconds={_skipAfterSec}, fallback_hit_sfx={_fallbackHitSfx})");
             Dbg($"PlayVfx={Sig(_mPlayVfx)} SfxPlay={Sig(_mSfxPlay)} DebugAudioPlay={Sig(_mDebugAudioPlay)} ModifyAttackHitCount={Sig(_mModifyHitCount)} AfterAttack={Sig(_mAfterAttack)} OnCombatWon={Sig(_mOnCombatWon)} RemoveCreatureNode={Sig(_mRemoveCreatureNode)} NCreature.creature={_pNCreatureCreature?.Name}");
         }
         catch (Exception ex)
@@ -106,23 +114,29 @@ public static class FollowThroughMod
             string? dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             if (dir == null) return true;
             string path = Path.Combine(dir, ConfigFileName);
-            if (!File.Exists(path))
+            var known = new Dictionary<string, object>();
+            if (File.Exists(path))
             {
-                try
-                {
-                    File.WriteAllText(path,
-                        "{\n  \"enabled\": true,\n  \"debug\": true,\n  \"max_total_sec\": 3.0,\n  \"hit_interval_sec\": 0.16,\n  \"hold_timeout_sec\": 6.0\n}\n");
-                }
-                catch { }
-                return true;
+                using var doc = JsonDocument.Parse(File.ReadAllText(path));
+                var root = doc.RootElement;
+                if (root.TryGetProperty("enabled", out var en) && en.ValueKind == JsonValueKind.False) return false;
+                if (root.TryGetProperty("debug", out var db)) _debug = db.ValueKind == JsonValueKind.True;
+                if (root.TryGetProperty("max_replay_seconds", out var mr) && mr.TryGetSingle(out var mrv)) _maxReplaySec = Math.Clamp(mrv, 0f, 60f);
+                if (root.TryGetProperty("show_skip_hint", out var sh)) _showSkipHint = sh.ValueKind != JsonValueKind.False;
+                if (root.TryGetProperty("skip_after_seconds", out var sa) && sa.TryGetSingle(out var sav)) _skipAfterSec = Math.Clamp(sav, 0f, 60f);
+                if (root.TryGetProperty("fallback_hit_sfx", out var fb)) _fallbackHitSfx = fb.ValueKind != JsonValueKind.False;
+                if (root.TryGetProperty("default_hit_gap_sec", out var dg) && dg.TryGetSingle(out var dgv)) _defaultHitGapSec = Math.Clamp(dgv, MinGapSec, 2f);
+                foreach (var prop in root.EnumerateObject()) known[prop.Name] = prop.Value.Clone();
             }
-            using var doc = JsonDocument.Parse(File.ReadAllText(path));
-            var root = doc.RootElement;
-            if (root.TryGetProperty("enabled", out var en) && en.ValueKind == JsonValueKind.False) return false;
-            if (root.TryGetProperty("debug", out var db)) _debug = db.ValueKind == JsonValueKind.True;
-            if (root.TryGetProperty("max_total_sec", out var mt) && mt.TryGetSingle(out var mtv)) _maxTotalSec = Math.Clamp(mtv, 0.2f, 6f);
-            if (root.TryGetProperty("hit_interval_sec", out var hi) && hi.TryGetSingle(out var hiv)) _hitIntervalSec = Math.Clamp(hiv, 0.05f, 0.5f);
-            if (root.TryGetProperty("hold_timeout_sec", out var ht) && ht.TryGetSingle(out var htv)) _holdTimeoutSec = Math.Clamp(htv, 0.5f, 10f);
+            // Write back with every current key present (additive: unknown/old keys are kept as-is).
+            known["enabled"] = true;
+            known["debug"] = _debug;
+            known["max_replay_seconds"] = _maxReplaySec;
+            known["show_skip_hint"] = _showSkipHint;
+            known["skip_after_seconds"] = _skipAfterSec;
+            known["fallback_hit_sfx"] = _fallbackHitSfx;
+            known["default_hit_gap_sec"] = _defaultHitGapSec;
+            try { File.WriteAllText(path, JsonSerializer.Serialize(known, new JsonSerializerOptions { WriteIndented = true }) + "\n"); } catch { }
         }
         catch (Exception ex) { GD.PrintErr($"{Tag} config parse failed, using defaults: {ex.Message}"); }
         return true;
@@ -164,6 +178,7 @@ public static class FollowThroughMod
         _fVisualAttacker = AccessTools.Field(_tAttackCommand, "_visualAttacker");
         _fShouldPlayAnim = AccessTools.Field(_tAttackCommand, "_shouldPlayAnimation");
         _fPlayOnEveryHit = AccessTools.Field(_tAttackCommand, "_playOnEveryHit");
+        _mAddResults = AccessTools.DeclaredMethod(_tAttackCommand, "AddResultsInternal");   // optional: rhythm
         if (_fResults == null) { missing = "AttackCommand._results"; return false; }
         if (_pAttacker == null) { missing = "AttackCommand.Attacker"; return false; }
         if (_pHitSfx == null) { missing = "AttackCommand.HitSfx"; return false; }
@@ -180,6 +195,14 @@ public static class FollowThroughMod
         if (_mRemoveCreatureNode == null) { missing = "NCombatRoom.RemoveCreatureNode"; return false; }
 
         _pVfxSpawnPos = AccessTools.Property(_tNCreature, "VfxSpawnPosition");
+        // Optional: the dead monster's own impact sound (fallback when the attack has no HitSfx).
+        var tMonster = AccessTools.TypeByName("MegaCrit.Sts2.Core.Models.MonsterModel");
+        if (tMonster != null)
+        {
+            _pCreatureMonster = typeof(Creature).GetProperties(All & ~BindingFlags.Static).FirstOrDefault(p => p.PropertyType == tMonster && p.GetIndexParameters().Length == 0);
+            _pTakeDamageSfx = AccessTools.Property(tMonster, "TakeDamageSfx");
+            if (_pTakeDamageSfx?.PropertyType != typeof(string)) _pTakeDamageSfx = null;
+        }
         _mSetAnimTrigger = AccessTools.Method(_tNCreature, "SetAnimationTrigger", new[] { typeof(string) });   // optional
         _pCreaturePlayer = AccessTools.Property(typeof(Creature), "Player");                                  // optional
         _pPlayerCharacter = _pCreaturePlayer != null ? AccessTools.Property(_pCreaturePlayer.PropertyType, "Character") : null;
@@ -246,7 +269,9 @@ public static class FollowThroughMod
         h.Patch(_mAfterAttack, prefix: M(nameof(AfterAttackPrefix)));
         h.Patch(_mOnCombatWon, prefix: M(nameof(OnCombatWonPrefix)));
         if (_mRoomExitTree != null) h.Patch(_mRoomExitTree, prefix: M(nameof(RoomExitTreePrefix)));
-        GD.Print($"{Tag} patches applied: RemoveCreatureNode, ModifyAttackHitCount, AfterAttack, OnCombatWon{(_mRoomExitTree != null ? ", NCombatRoom._ExitTree" : "")}");
+        if (_mAddResults != null) h.Patch(_mAddResults, postfix: M(nameof(AddResultsPostfix)));
+        int inputs = PatchInputHandlers(h);
+        GD.Print($"{Tag} patches applied: RemoveCreatureNode, ModifyAttackHitCount, AfterAttack, OnCombatWon{(_mRoomExitTree != null ? ", NCombatRoom._ExitTree" : "")}{(_mAddResults != null ? ", AddResultsInternal" : "")}, {inputs} input handlers");
     }
 
     // Kill switch: log once, stop doing anything. Patches stay but every one of them is a pass-through.
@@ -305,8 +330,16 @@ public static class FollowThroughMod
 
     // ===== Patch 3: decide on and start the replay =====
 
-    private sealed record Plan(int Remaining, string? HitSfx, string? TmpHitSfx, string? HitVfx, List<(Creature Target, Vector2 Pos, int Amount)> Targets, string Attacker,
-        Creature? AnimCreature, string? AnimName, float AnimDelay, string? AttackSfx);
+    private sealed record Plan(int Remaining, string? HitSfx, string? TmpHitSfx, string? HitVfx, List<(Creature Target, Vector2 Pos, int Amount, string? ImpactSfx)> Targets, string Attacker,
+        Creature? AnimCreature, string? AnimName, float AnimDelay, string? AttackSfx, float Gap);
+
+    // Patch: stamp each real hit of an attack (AddResultsInternal runs once per hit).
+    private static void AddResultsPostfix(object __instance)
+    {
+        if (_disabled) return;
+        try { _hitTimes.GetOrCreateValue(__instance).Add(Time.GetTicksMsec()); }
+        catch (Exception ex) { Disable("AddResultsInternal postfix", ex); }
+    }
 
     private static void AfterAttackPrefix(object[] __args)
     {
@@ -324,6 +357,7 @@ public static class FollowThroughMod
             _replay?.TrySetResult(false);
             _replay = tcs;
             int gen = _generation;
+            _holdTimeoutForPending = Math.Max(6f, plan.Remaining * plan.Gap + 3f);   // scales with the replay
             Callable.From(() => { _ = RunReplay(plan, tcs, gen); }).CallDeferred();
         }
         catch (Exception ex) { Disable("AfterAttack prefix", ex); }
@@ -351,7 +385,7 @@ public static class FollowThroughMod
         if (!inProgress || !ending) { Dbg($"skip: combat not ending (inProgress={inProgress}, isEnding={ending}), hits={done}/{attackCount}, attacker={who}"); return null; }
 
         // Targets of the final real hit (the corpses), with that hit's pre-block per-hit damage.
-        var targets = new List<(Creature, Vector2, int)>();
+        var targets = new List<(Creature, Vector2, int, string?)>();
         if (_fResults.GetValue(cmd) is IList hits && hits.Count > 0 && hits[hits.Count - 1] is IEnumerable last)
         {
             foreach (var r in last)
@@ -364,7 +398,9 @@ public static class FollowThroughMod
                 int amount = blocked + unblocked + overkill;   // what the hit would have dealt to an unblocked target
                 Vector2? pos = _deathPos.TryGetValue(recv, out var pb) ? pb.Value : LivePos(recv);
                 if (pos == null) { Dbg($"no position for {CreatureName(recv)}; skipped that target"); continue; }
-                targets.Add((recv, pos.Value, Math.Max(0, amount)));
+                string? impact = null;
+                try { if (_pCreatureMonster?.GetValue(recv) is { } mm) impact = _pTakeDamageSfx?.GetValue(mm) as string; } catch { }
+                targets.Add((recv, pos.Value, Math.Max(0, amount), impact));
                 Dbg($"target {CreatureName(recv)} lastHit blocked={blocked} unblocked={unblocked} overkill={overkill} -> show {amount} at {pos.Value}");
             }
         }
@@ -392,37 +428,59 @@ public static class FollowThroughMod
             Dbg($"anim: shouldPlay={should} everyHit={everyHit} name={_fAnimName?.GetValue(cmd) ?? "none"} delay={_fAnimDelay?.GetValue(cmd)} -> {(animName != null ? "replay swing" : "no swing")}");
         }
         catch (Exception ex) { Dbg($"anim lookup failed (no swing): {ex.Message}"); animName = null; }
-        Dbg($"REPLAY: attacker={who} hits landed={done}/{attackCount} remaining={remaining} sfx={sfx ?? tmpSfx ?? "none"} vfx={vfx ?? "none"} targets={targets.Count}");
-        return new Plan(remaining, sfx, tmpSfx, vfx, targets, who, animCreature, animName, animDelay, attackSfx);
+        // Natural rhythm: the real attack's own measured per-hit gap; else the last one measured for the same
+        // style of attack; else the configured default.
+        string style = $"{animName}|{vfx}";
+        float gap; string gapSource;
+        if (_hitTimes.TryGetValue(cmd, out var times) && times.Count >= 2)
+        {
+            gap = Math.Max(MinGapSec, (times[^1] - times[0]) / 1000f / (times.Count - 1));
+            _gapByStyle[style] = gap; gapSource = $"measured over {times.Count} real hits";
+        }
+        else if (_gapByStyle.TryGetValue(style, out var g)) { gap = g; gapSource = "last measured for this attack style"; }
+        else { gap = Math.Max(_defaultHitGapSec, animDelay + 0.1f); gapSource = "default"; }
+        if (_maxReplaySec > 0f && gap * remaining > _maxReplaySec)
+        {
+            float capped = Math.Max(MinGapSec, _maxReplaySec / remaining);
+            gapSource += $", compressed from {gap:0.000}s by max_replay_seconds={_maxReplaySec}";
+            gap = capped;
+        }
+        string impactNote = sfx != null ? sfx : tmpSfx != null ? $"tmp:{tmpSfx}" : _fallbackHitSfx ? $"fallback:{targets[0].Item4 ?? "none"}" : "none";
+        Dbg($"REPLAY: attacker={who} hits landed={done}/{attackCount} remaining={remaining} gap={gap:0.000}s ({gapSource}) est={gap * remaining:0.00}s sfx={impactNote} vfx={vfx ?? "none"} targets={targets.Count}");
+        return new Plan(remaining, sfx, tmpSfx, vfx, targets, who, animCreature, animName, animDelay, attackSfx, gap);
     }
 
     private static async Task RunReplay(Plan plan, TaskCompletionSource<bool> tcs, int gen)
     {
         int played = 0;
         ulong t0 = Time.GetTicksMsec();
+        bool skipped = false;
         try
         {
             if (Engine.GetMainLoop() is not SceneTree tree) return;
-            // Spacing: the game's own rhythm, sped up so the whole chain fits in max_total_sec.
-            // With a swing per hit, each hit takes about the swing's own delay (+ a beat), as in the real attack.
+            // Absolute schedule: hit k lands at t0 + k*gap (k = 1..n), so the opening delay is one gap and the
+            // total is exactly n*gap (timer jitter does not accumulate). The swing starts swingLead before its hit.
+            float gap = plan.Gap;
             bool swing = plan.AnimName != null;
-            float baseInterval = swing ? Math.Max(_hitIntervalSec, plan.AnimDelay + 0.1f) : _hitIntervalSec;
-            float interval = Math.Max(_minIntervalSec, Math.Min(baseInterval, _maxTotalSec / Math.Max(1, plan.Remaining)));
-            float swingLead = swing ? Math.Min(plan.AnimDelay, interval * 0.7f) : 0f;   // swing first, hit lands after
-            for (int i = 0; i < plan.Remaining; i++)
+            float swingLead = swing ? Math.Min(plan.AnimDelay, gap * 0.7f) : 0f;
+            float total = gap * plan.Remaining;
+            Skip.Begin(t0, total);
+            for (int k = 1; k <= plan.Remaining; k++)
             {
-                await tree.ToSignal(tree.CreateTimer(Math.Max(0.02f, (i == 0 ? Math.Min(_hitIntervalSec, interval) : interval) - swingLead)), SceneTreeTimer.SignalName.Timeout);
-                if (_disabled || gen != _generation) { Dbg($"replay cancelled after {played}/{plan.Remaining} (room exit or disabled)"); return; }
-                if (swing && Swing(plan) && swingLead > 0f)
+                ulong hitAt = t0 + (ulong)(k * gap * 1000f);
+                if (swing)
                 {
-                    await tree.ToSignal(tree.CreateTimer(swingLead), SceneTreeTimer.SignalName.Timeout);
-                    if (_disabled || gen != _generation) { Dbg($"replay cancelled after {played}/{plan.Remaining} (room exit or disabled)"); return; }
+                    if (!await WaitUntil(tree, hitAt - (ulong)(swingLead * 1000f), gen)) break;
+                    if (Skip.Requested) { skipped = true; break; }
+                    Swing(plan);
                 }
+                if (!await WaitUntil(tree, hitAt, gen)) break;
+                if (Skip.Requested) { skipped = true; break; }
                 var container = VfxContainer();
-                if (container == null) { Dbg($"replay stopped after {played}/{plan.Remaining}: combat VFX container gone"); return; }
-                PlaySfx(plan);
-                foreach (var (target, pos, amount) in plan.Targets)
+                if (container == null) { Dbg($"replay stopped after {played}/{plan.Remaining}: combat VFX container gone"); break; }
+                foreach (var (target, pos, amount, impact) in plan.Targets)
                 {
+                    PlaySfx(plan, impact);
                     if (plan.HitVfx != null) _mPlayVfx!.Invoke(null, BuildArgs(_mPlayVfx, pos, plan.HitVfx, container));
                     var jitter = new Vector2(_jitter.Next(-30, 31), _jitter.Next(-20, 11));   // own RNG: never the game's
                     if (_mDamageNumCreate!.Invoke(null, new object[] { pos + new Vector2(0f, -100f) + jitter, amount }) is Node num
@@ -435,10 +493,24 @@ public static class FollowThroughMod
         catch (Exception ex) { Disable("replay", ex); }
         finally
         {
-            Dbg($"replay done: played {played}/{plan.Remaining} hits for {plan.Attacker} in {Time.GetTicksMsec() - t0} ms");
+            Skip.End();
+            Dbg($"replay {(skipped ? "SKIPPED by player" : "done")}: played {played}/{plan.Remaining} hits for {plan.Attacker} in {Time.GetTicksMsec() - t0} ms (planned {plan.Gap * plan.Remaining * 1000f:0} ms)");
             tcs.TrySetResult(true);
             if (ReferenceEquals(_replay, tcs)) _replay = null;
         }
+    }
+
+    // Waits (frame by frame) until the absolute tick; false if the replay was cancelled meanwhile.
+    private static async Task<bool> WaitUntil(SceneTree tree, ulong atMs, int gen)
+    {
+        while (Time.GetTicksMsec() < atMs)
+        {
+            Skip.Tick();
+            if (Skip.Requested) return true;
+            await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
+            if (_disabled || gen != _generation) { Dbg("replay cancelled (room exit or disabled)"); return false; }
+        }
+        return !_disabled && gen == _generation;
     }
 
     // Godot-only swing: NCreature.SetAnimationTrigger on the (living) attacker's node + the attack swoosh.
@@ -457,13 +529,15 @@ public static class FollowThroughMod
         catch (Exception ex) { Dbg($"swing failed (ignored): {ex.InnerException?.Message ?? ex.Message}"); return false; }
     }
 
-    private static void PlaySfx(Plan plan)
+    private static void PlaySfx(Plan plan, string? impactSfx)
     {
         try
         {
             if (plan.HitSfx != null) _mSfxPlay!.Invoke(null, BuildArgs(_mSfxPlay, plan.HitSfx));
             else if (plan.TmpHitSfx != null && _mDebugAudioPlay != null && _pDebugAudioInstance?.GetValue(null) is { } mgr)
                 _mDebugAudioPlay.Invoke(mgr, BuildArgs(_mDebugAudioPlay, plan.TmpHitSfx));
+            else if (_fallbackHitSfx && impactSfx != null)
+                _mSfxPlay!.Invoke(null, BuildArgs(_mSfxPlay, impactSfx));   // the corpse's own "takes damage" impact
         }
         catch (Exception ex) { Dbg($"sfx failed (ignored): {ex.InnerException?.Message ?? ex.Message}"); }
     }
@@ -494,13 +568,15 @@ public static class FollowThroughMod
             if (_disabled || _holding || pending == null || pending.Task.IsCompleted) return true;
             _holding = true;
             Dbg("rewards HELD: replay in progress");
-            _ = ReleaseLater(__instance, (object[])__args.Clone(), pending.Task);
+            _ = ReleaseLater(__instance, (object[])__args.Clone(), pending.Task, _holdTimeoutForPending);
             return false;
         }
         catch (Exception ex) { _holding = false; Disable("OnCombatWon prefix", ex); return true; }
     }
 
-    private static async Task ReleaseLater(object ui, object[] args, Task replay)
+    private static float _holdTimeoutForPending = 6f;
+
+    private static async Task ReleaseLater(object ui, object[] args, Task replay, float timeoutSec)
     {
         ulong t0 = Time.GetTicksMsec();
         bool timedOut = false;
@@ -510,7 +586,7 @@ public static class FollowThroughMod
             {
                 while (!replay.IsCompleted)
                 {
-                    if (Time.GetTicksMsec() - t0 > (ulong)(_holdTimeoutSec * 1000)) { timedOut = true; break; }
+                    if (Time.GetTicksMsec() - t0 > (ulong)(timeoutSec * 1000)) { timedOut = true; break; }
                     await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
                 }
             }
@@ -519,7 +595,8 @@ public static class FollowThroughMod
         finally
         {
             _holding = false;
-            Dbg($"rewards RELEASED after {Time.GetTicksMsec() - t0} ms{(timedOut ? " (timeout)" : "")}");
+            if (timedOut) GD.Print($"{Tag} rewards RELEASED by safety timeout after {Time.GetTicksMsec() - t0} ms (limit {timeoutSec:0.0}s)");
+            else Dbg($"rewards RELEASED after {Time.GetTicksMsec() - t0} ms");
             try
             {
                 if (ui is GodotObject go && !GodotObject.IsInstanceValid(go)) Dbg("rewards: NCombatUi gone; original not invoked");
@@ -541,6 +618,7 @@ public static class FollowThroughMod
         try
         {
             _generation++;
+            Skip.End();
             _replay?.TrySetResult(false);
             _replay = null;
         }
