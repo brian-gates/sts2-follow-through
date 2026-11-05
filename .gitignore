@@ -1,10 +1,16 @@
 bin/
 obj/
 out/
+dist/
 *.dll
 *.pdb
 *.user
 .vs/
 .idea/
+.vscode/
+.DS_Store
 .mcp.json
-dist/
+# Per-machine build settings (see local.props.example)
+local.props
+# ModUploader CLI binary (downloaded per machine)
+tools/

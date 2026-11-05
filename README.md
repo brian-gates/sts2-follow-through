@@ -1,64 +1,67 @@
-# Follow Through (Slay the Spire 2 mod, spike)
+# Follow Through
 
-When a multi-hit attack kills the last enemy partway through, the hits the game skipped still play out
-for show: the attacker's swing (when the attack swings on every hit), hit VFX at the corpse's last
-position, and floating damage numbers (including overkill). The local rewards screen waits for them.
+A Slay the Spire 2 mod. When a multi-hit attack kills the last enemy partway through, the rest of the hits
+still play out on the corpse, for show:
 
-Cosmetic only. It deals no damage, changes no game state and starts no game actions, so it is safe in
-co-op. Each player sees the replay on their own screen.
+- your character swings for every remaining hit, as the real attack would
+- the attack's hit effect lands where the enemy fell
+- the impact sound plays (the enemy's own impact sound if the attack has none)
+- a floating damage number per hit shows what it would have dealt, overkill included
 
-## How it works
+The victory/rewards screen waits until the show is over. Every hit plays at the attack's natural rhythm.
 
-- `NCombatRoom.RemoveCreatureNode` prefix: saves each dying creature's `NCreature.VfxSpawnPosition`.
-- `Hook.ModifyAttackHitCount` postfix: records the real hit count of each `AttackCommand`;
-  `AttackCommand.AddResultsInternal` postfix: timestamps each real hit (the attack's natural rhythm).
-- `Hook.AfterAttack` prefix: if hits remain (`attackCount - _results.Count`), the attacker is alive and
-  `CombatManager.IsEnding`, starts a Godot-only replay at the attack's own per-hit spacing (measured, else
-  the last measured for that attack style, else `default_hit_gap_sec`). It uses `NCreature.SetAnimationTrigger`,
-  `SfxCmd.Play`, `VfxCmd.PlayVfx(Vector2, string, Control)` and `NDamageNumVfx.Create(Vector2, int)`. When the
-  attack has no hit sound, the corpse's own `MonsterModel.TakeDamageSfx` impact is used.
-- `NCombatUi.OnCombatWon` prefix: holds the local rewards screen until the replay ends. The safety
-  timeout scales with the replay: remaining x gap + 3 s, never under 6 s.
-- Skip: once a replay has run `skip_after_seconds` with more than 0.75 s left, a "Click to skip" hint
-  fades in. The first click, key or controller button then ends the replay and releases the rewards.
-  While armed, one temporary catcher sits on top: a CanvasLayer (Layer 1024) holding a full-rect Control
-  with `MouseFilter=Stop` and `FocusMode=All` that grabs focus. Clicks, keys and controller buttons reach it
-  through the Control's `GuiInput` signal, and `AcceptEvent()` stops them there, so nothing underneath
-  reacts. Signals are used because mod-defined Node subclasses are not registered Godot scripts, so `_Input`
-  overrides never run. A fallback polls `Input.IsAnythingPressed()` for a press that never reaches the
-  signal; it skips but cannot consume. Motion and the mouse wheel pass through. The catcher is removed when
-  the replay ends, or 0.35 s after a skip. Short replays never add it.
-- `NCombatRoom._ExitTree` prefix: cancels any replay.
+![Follow Through: a Tear Asunder finishing on a fallen beetle](workshop/preview.jpg)
 
-Game members are resolved by name at startup. If any lookup fails, the mod logs once and disables
-itself. If a patch throws at runtime, the mod logs once and unpatches.
+## Skipping
 
-## Config
+Short replays just play. Once a replay has run for 2 seconds (`skip_after_seconds`) with more than about
+0.75 s left, a small **Click to skip** fades in at the bottom of the screen. Any mouse click, key or controller
+button then ends the replay and opens the rewards. That click is used up by the skip, so it can't click
+anything on the rewards screen behind it. Clicks before the hint appears are not intercepted.
 
-`STS2_FollowThrough.conf` sits next to the DLL in `mods/`. It is created on first run, and missing keys are
-added on each launch:
+## Purely cosmetic, co-op safe
+
+Follow Through only draws and plays sounds. It deals no damage, fires no game triggers (relics, powers,
+"on attack" effects), uses none of the game's random numbers and creates no game actions. The combat has
+already ended in the game's own simulation when the replay starts. The only thing it delays is your own
+rewards screen, which the game opens locally on each player's machine. In co-op every player who has the
+mod sees the replay on their own screen. Players without it see the normal ending, and runs never desync.
+The manifest declares `affects_gameplay: false`.
+
+## Settings
+
+`STS2_FollowThrough.conf` sits next to the mod's DLL and is created on first launch:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `enabled` | true | |
-| `debug` | true | log each replay decision as `[FollowThrough] ...` in godot.log |
-| `max_replay_seconds` | 0 | 0 = no cap; >0 compresses the spacing so the replay fits |
-| `show_skip_hint` | true | show the "Click to skip" hint when the skip arms |
-| `skip_after_seconds` | 2.0 | the skip (hint and input) arms only after this long |
-| `fallback_hit_sfx` | true | play the corpse's impact sound when the attack has no hit sound |
-| `default_hit_gap_sec` | 0.3 | per-hit spacing when the real rhythm is unknown |
+| `enabled` | `true` | turn the mod off without uninstalling |
+| `max_replay_seconds` | `0` | 0 = no limit; above 0, long chains speed up to fit in that many seconds |
+| `show_skip_hint` | `true` | show the "Click to skip" hint (skipping still works without it) |
+| `skip_after_seconds` | `2.0` | how long a replay runs before it can be skipped |
+| `fallback_hit_sfx` | `true` | play the enemy's impact sound when the attack has no hit sound |
+| `default_hit_gap_sec` | `0.3` | spacing between hits when the attack's real rhythm couldn't be measured |
+| `debug` | `false` | log each replay decision to the game log (`[FollowThrough] ...`) |
 
-Debug-only keys (never written by the mod; add them by hand to test the skip in-game):
-`debug_inject_skip_after_seconds` (>0 injects a click via `Input.ParseInputEvent` that long after the skip
-arms), `debug_inject_key` (inject Enter instead), and `debug_inject_prearm_seconds` (>0 injects a click at that
-replay time before arming, to check pass-through).
+## Known limits
 
-## Build & install (macOS)
+- Only attacks whose hits stop because every target died are replayed. Attacks cut short for other reasons
+  (the attacker dying, the enemy reviving) are left alone.
+- If the killing hit was the first, the spacing between hits uses `default_hit_gap_sec`, since there was no
+  real rhythm to measure.
+- The replay targets the enemies hit by the last real hit. Random-target attacks replay on that enemy.
+- Built and tested against game version v0.107.1. Members of the game are looked up by name at startup.
+  After a game update or on the public beta branch, if anything it needs is missing, the mod logs one line
+  and turns itself off instead of misbehaving.
 
-```bash
-./scripts/build.sh      # dotnet build -> out/ (STS2GameDir overridable)
-./scripts/install.sh    # refuses while the game runs; stages, then mv into mods/
-```
+## Install
 
-Requires the .NET 9 SDK (or newer) and a local game install (the game's assemblies are referenced and
-never bundled).
+- **Steam Workshop:** subscribe, enable it in **Settings > Mods**, restart the game.
+- **Manual:** put `STS2_FollowThrough.dll` and `STS2_FollowThrough.json` (the `mod_manifest.json`, renamed) in
+  the game's `mods/` folder: `SlayTheSpire2.app/Contents/MacOS/mods/` on macOS, `<game dir>/mods/` on
+  Windows/Linux. Restart the game.
+
+Building from source and the test approach: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT, see [LICENSE](LICENSE). Slay the Spire 2 is (c) Mega Crit; this mod bundles none of its files.

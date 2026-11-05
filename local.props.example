@@ -1,0 +1,6 @@
+<!-- Copy to local.props (git-ignored) to point the build at a non-default game install. -->
+<Project>
+  <PropertyGroup>
+    <STS2GameDir>/path/to/Slay the Spire 2</STS2GameDir>
+  </PropertyGroup>
+</Project>

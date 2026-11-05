@@ -38,12 +38,12 @@ namespace STS2_FollowThrough;
 public static partial class FollowThroughMod
 {
     private const string Tag = "[FollowThrough]";
-    private const string BuildTag = "2026-11-05-skip";
+    private const string BuildTag = "0.9.0";
     private const string ConfigFileName = "STS2_FollowThrough.conf";
     private const string HarmonyId = "com.sts2followthrough";
 
     // Config
-    private static bool _debug = true;            // log each replay decision (spike default: on)
+    private static bool _debug;                   // log each replay decision (config "debug", default off)
     private static float _maxReplaySec = 0f;       // 0 = no cap (natural rhythm); >0 compresses spacing to fit
     private static bool _showSkipHint = true;
     private static float _skipAfterSec = 2.0f;     // skip (hint + input) only arms after this much replay...

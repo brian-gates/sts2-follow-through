@@ -2,8 +2,8 @@
   "id": "STS2_FollowThrough",
   "name": "Follow Through",
   "author": "zaxnyd",
-  "description": "When a multi-hit attack kills the last enemy partway through, the remaining hits still play out on the corpse for show: hit sounds, hit effects and damage numbers (including overkill). Purely cosmetic: no damage, no game-state change, co-op safe. The victory/rewards screen waits for the show to finish.",
-  "version": "0.1.0",
+  "description": "When a multi-hit attack kills the last enemy partway through, the rest of the hits still play out on the corpse: the swing, the hit effect, the impact sound and the damage numbers (overkill included). Purely cosmetic and client-side: no extra damage, no game-state change, co-op safe. Long replays can be skipped with a click.",
+  "version": "0.9.0",
   "has_pck": false,
   "has_dll": true,
   "affects_gameplay": false
